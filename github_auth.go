@@ -25,18 +25,28 @@ import (
 // Manage the app at: https://github.com/settings/developers -> OAuth Apps -> devflow
 const DevflowOAuthClientID = "Ov23lijHU2vxBCpShn1Q"
 
-// GitHub token key for keyring storage
+// GitHub token key for SecretStore storage
 const githubTokenKey = "github_token"
 
 // GitHubOAuth handles GitHub authentication and token management via Device Flow
 type GitHubOAuth struct {
-	log func(...any)
+	log   func(...any)
+	store SecretStore
 }
 
 // NewGitHubOAuth creates a new GitHub authentication handler
 func NewGitHubOAuth() *GitHubOAuth {
 	return &GitHubOAuth{
 		log: func(...any) {},
+	}
+}
+
+// SetStore injects the SecretStore used to persist the OAuth token.
+// Without a store, EnsureGitHubAuth and DeviceFlowAuth report a clear error
+// (they can only authenticate interactively if they can store the result).
+func (a *GitHubOAuth) SetStore(store SecretStore) {
+	if store != nil {
+		a.store = store
 	}
 }
 
@@ -70,17 +80,14 @@ type tokenResponse struct {
 	ErrorDesc   string `json:"error_description"`
 }
 
-// EnsureGitHubAuth checks if GitHub is authenticated via keyring, and if not, initiates Device Flow
+// EnsureGitHubAuth checks if GitHub is authenticated via the SecretStore, and if not, initiates Device Flow
 func (a *GitHubOAuth) EnsureGitHubAuth() error {
-	// Initialize keyring (auto-installs if needed)
-	kr, err := NewKeyring()
-	if err != nil {
-		return err
+	if a.store == nil {
+		return fmt.Errorf("github auth needs a SecretStore: inject one with SetStore (e.g. github.com/tinywasm/keyring) or set GH_TOKEN")
 	}
-	kr.SetLog(a.log)
 
-	// Try to load saved token from keyring
-	token, err := kr.Get(githubTokenKey)
+	// Try to load saved token from the store
+	token, err := a.store.Get(githubTokenKey)
 	if err == nil && token != "" {
 		// Verify the token works by configuring gh
 		if a.configureGhWithToken(token) == nil {
@@ -89,11 +96,11 @@ func (a *GitHubOAuth) EnsureGitHubAuth() error {
 			}
 		}
 		// Token is invalid, remove it
-		kr.Delete(githubTokenKey)
+		a.store.Delete(githubTokenKey)
 	}
 
 	// Not authenticated - initiate Device Flow
-	token, err = a.DeviceFlowAuth(kr)
+	token, err = a.DeviceFlowAuth()
 	if err != nil {
 		return err
 	}
@@ -103,7 +110,11 @@ func (a *GitHubOAuth) EnsureGitHubAuth() error {
 }
 
 // DeviceFlowAuth initiates GitHub OAuth Device Flow and returns an access token
-func (a *GitHubOAuth) DeviceFlowAuth(kr *Keyring) (string, error) {
+func (a *GitHubOAuth) DeviceFlowAuth() (string, error) {
+	if a.store == nil {
+		return "", fmt.Errorf("github auth needs a SecretStore: inject one with SetStore (e.g. github.com/tinywasm/keyring) or set GH_TOKEN")
+	}
+
 	// Step 1: Request device and user codes
 	codeResp, err := a.requestDeviceCode()
 	if err != nil {
@@ -129,8 +140,8 @@ func (a *GitHubOAuth) DeviceFlowAuth(kr *Keyring) (string, error) {
 		return "", err
 	}
 
-	// Step 4: Save token to keyring
-	if err := kr.Set(githubTokenKey, token); err != nil {
+	// Step 4: Save token to the store
+	if err := a.store.Set(githubTokenKey, token); err != nil {
 		a.log(fmt.Sprintf("Warning: could not save token: %v", err))
 	}
 

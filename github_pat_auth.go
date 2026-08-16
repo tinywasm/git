@@ -10,20 +10,21 @@ import (
 
 const ghTokenKey = "GH_TOKEN"
 
-// GitHubPATAuth manages the GitHub PAT via the system keyring.
+// GitHubPATAuth manages the GitHub PAT via an injected SecretStore.
 // It is used to recover the gh CLI session non-interactively.
 type GitHubPATAuth struct {
-	kr  *Keyring
-	log func(...any)
+	store SecretStore
+	log   func(...any)
 }
 
-// NewGitHubPATAuth creates a GitHubPATAuth with an initialized keyring.
-func NewGitHubPATAuth() (*GitHubPATAuth, error) {
-	kr, _ := NewKeyring()
+// NewGitHubPATAuth creates a GitHubPATAuth over the given store.
+// The store may be nil: the auth flow then falls back to the GH_TOKEN
+// environment variable and reports a clear error when neither exists.
+func NewGitHubPATAuth(store SecretStore) *GitHubPATAuth {
 	return &GitHubPATAuth{
-		kr:  kr,
-		log: func(...any) {},
-	}, nil
+		store: store,
+		log:   func(...any) {},
+	}
 }
 
 // SetLog sets the logging function.
@@ -33,29 +34,29 @@ func (a *GitHubPATAuth) SetLog(fn func(...any)) {
 	}
 }
 
-// HasToken returns true if the GitHub PAT is already stored in the environment or keyring.
+// HasToken returns true if the GitHub PAT is already stored in the environment or SecretStore.
 func (a *GitHubPATAuth) HasToken() bool {
 	if os.Getenv("GH_TOKEN") != "" {
 		return true
 	}
-	if a.kr == nil {
+	if a.store == nil {
 		return false
 	}
-	tok, err := a.kr.Get(ghTokenKey)
+	tok, err := a.store.Get(ghTokenKey)
 	return err == nil && tok != ""
 }
 
-// EnsureToken returns the PAT from the environment or keyring; if absent, prompts once and persists.
+// EnsureToken returns the PAT from the environment or SecretStore; if absent, prompts once and persists.
 func (a *GitHubPATAuth) EnsureToken() (string, error) {
 	if envTok := os.Getenv("GH_TOKEN"); envTok != "" {
 		return envTok, nil
 	}
 
-	if a.kr == nil {
-		return "", fmt.Errorf("keyring is unavailable and GH_TOKEN env var is not set")
+	if a.store == nil {
+		return "", fmt.Errorf("no SecretStore configured and GH_TOKEN env var is not set")
 	}
 
-	tok, err := a.kr.Get(ghTokenKey)
+	tok, err := a.store.Get(ghTokenKey)
 	if err == nil && tok != "" {
 		return tok, nil
 	}
@@ -73,24 +74,24 @@ func (a *GitHubPATAuth) EnsureToken() (string, error) {
 		return "", fmt.Errorf("no GitHub token provided")
 	}
 
-	if err := a.kr.Set(ghTokenKey, tok); err != nil {
-		a.log(fmt.Sprintf("warning: could not save GitHub token to keyring: %v", err))
+	if err := a.store.Set(ghTokenKey, tok); err != nil {
+		a.log(fmt.Sprintf("warning: could not save GitHub token to store: %v", err))
 	}
 
 	return tok, nil
 }
 
-// Reset removes the GitHub PAT from the keyring.
+// Reset removes the GitHub PAT from the SecretStore.
 func (a *GitHubPATAuth) Reset() error {
-	if a.kr == nil {
-		return fmt.Errorf("keyring is unavailable")
+	if a.store == nil {
+		return fmt.Errorf("no SecretStore configured")
 	}
-	return a.kr.Delete(ghTokenKey)
+	return a.store.Delete(ghTokenKey)
 }
 
 // EnsureGitHubAuth fulfills the GitHubAuthenticator interface.
 func (a *GitHubPATAuth) EnsureGitHubAuth() error {
-	return EnsureGHSession(RealRunner{})
+	return EnsureGHSession(RealRunner{}, a.store)
 }
 
 // termLink returns an OSC 8 terminal hyperlink (supported by most modern terminals).
