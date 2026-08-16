@@ -16,8 +16,10 @@ type GitHub struct {
 
 // NewGitHub creates handler and verifies gh CLI availability.
 // logFn is used to display authentication messages during Device Flow.
-// If not authenticated, it initiates OAuth Device Flow automatically.
-func NewGitHub(logFn func(...any), auth ...GitHubAuthenticator) (*GitHub, error) {
+// secretStore is injected into the default OAuth authenticator (ignored when
+// an authenticator is passed explicitly). If not authenticated, it initiates
+// OAuth Device Flow automatically.
+func NewGitHub(logFn func(...any), secretStore SecretStore, auth ...GitHubAuthenticator) (*GitHub, error) {
 	if logFn == nil {
 		logFn = func(...any) {}
 	}
@@ -36,8 +38,10 @@ func NewGitHub(logFn func(...any), auth ...GitHubAuthenticator) (*GitHub, error)
 		// Use injected authenticator (already has TUI logger set)
 		authenticator = auth[0]
 	} else {
-		// Create default authenticator and set logger
-		authenticator = NewGitHubOAuth()
+		// Create default authenticator, inject the store and set logger
+		oAuth := NewGitHubOAuth()
+		oAuth.SetStore(secretStore)
+		authenticator = oAuth
 		authenticator.SetLog(gh.log)
 	}
 	if err := authenticator.EnsureGitHubAuth(); err != nil {
@@ -178,11 +182,12 @@ func (gh *GitHub) GetHelpfulErrorMessage(err error) string {
 }
 
 // EnsureGHSession verifies the gh session and, if expired, restores it non-interactively
-// from the keyring PAT via `gh auth login --with-token`. No-op when the session is healthy.
-// The probe and verification run through runner so tests can inject a double and never
-// touch a real gh CLI; restore itself always uses the real process (only reached when the
-// probe genuinely fails, i.e. never under an injected test Runner that reports success).
-func EnsureGHSession(runner Runner) error {
+// from the PAT stored in secretStore via `gh auth login --with-token`. No-op when the
+// session is healthy. The probe and verification run through runner so tests can inject
+// a double and never touch a real gh CLI; restore itself always uses the real process
+// (only reached when the probe genuinely fails, i.e. never under an injected test Runner
+// that reports success).
+func EnsureGHSession(runner Runner, secretStore SecretStore) error {
 	// Skip if in a test environment or headless/CI without a real gh.
 	if os.Getenv("GO_WANT_HELPER_PROCESS") == "1" || os.Getenv("CI") == "true" {
 		return nil
@@ -193,10 +198,7 @@ func EnsureGHSession(runner Runner) error {
 		return nil // session healthy
 	}
 
-	auth, err := NewGitHubPATAuth()
-	if err != nil {
-		return err
-	}
+	auth := NewGitHubPATAuth(secretStore)
 	tok, err := auth.EnsureToken()
 	if err != nil {
 		return err

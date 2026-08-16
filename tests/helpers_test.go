@@ -1,10 +1,13 @@
 package git_test
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"github.com/tinywasm/git"
 )
 
 // testChdir changes to the specified directory and returns a cleanup function.
@@ -57,4 +60,27 @@ func testCreateGoModule(moduleName string) (dir string, cleanup func()) {
 	}
 
 	return dir, cleanup
+}
+
+// memStore is an in-memory SecretStore for tests.
+type memStore map[string]string
+
+var _ git.SecretStore = (memStore)(nil)
+
+func (m memStore) Set(key, value string) error {
+	m[key] = value
+	return nil
+}
+
+func (m memStore) Get(key string) (string, error) {
+	v, ok := m[key]
+	if !ok {
+		return "", fmt.Errorf("no value for key %q", key)
+	}
+	return v, nil
+}
+
+func (m memStore) Delete(key string) error {
+	delete(m, key)
+	return nil
 }
