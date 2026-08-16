@@ -84,7 +84,7 @@ func (gh *GitHub) GetCurrentUser() (string, error) {
 
 // repoInfo returns basic information about a repository.
 // If repoRef is empty, it queries the repository in the current directory.
-func (gh *GitHub) repoInfo(repoRef string) (owner, name, visibility string, err error) {
+func (gh *GitHub) RepoInfo(repoRef string) (owner, name, visibility string, err error) {
 	runner := gh.getSecretRunner()
 	args := []string{"repo", "view", "--json", "owner,name,visibility"}
 	if repoRef != "" {
