@@ -1,8 +1,8 @@
 package git
 
 import (
-	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/tinywasm/command"
 	"io"
@@ -28,10 +28,43 @@ const DevflowOAuthClientID = "Ov23lijHU2vxBCpShn1Q"
 // GitHub token key for SecretStore storage
 const githubTokenKey = "github_token"
 
+// TokenValidationResult distingue los tres desenlaces posibles de la
+// validación de un token contra la API de GitHub. Sin esta distinción,
+// cualquier tropiezo de una herramienta externa se interpretaba como
+// "credencial inválida" y borraba el token.
+type TokenValidationResult uint8
+
+const (
+	TokenValid           TokenValidationResult = iota // GitHub aceptó el token
+	TokenRejected                                     // GitHub devolvió 401: el token ya no sirve
+	TokenUnverifiable                                 // no se pudo comprobar: red, gh, llavero…
+)
+
+const githubAPIUserURL = "https://api.github.com/user"
+
+// tokenValidationTimeout es el timeout de la validación de tokens contra la API.
+const tokenValidationTimeout = 10 * time.Second
+
+// Motivos exactos de cada rama del flujo: nada de literales sueltos en la lógica.
+const (
+	// logGhConfigFailed avisa cuando GitHub aceptó el token pero gh no pudo
+	// adoptarlo (llavero de gh bloqueado, PATH incompleto, sin red…).
+	logGhConfigFailed = "aviso: el token es válido pero no se pudo configurar gh: "
+
+	// logTokenRejected anuncia que la credencial guardada ya no sirve.
+	logTokenRejected = "GitHub rechazó el token guardado (401): hay que autenticarse de nuevo"
+
+	// tokenUnverifiableMessage avisa y se conserva el token: puede ser
+	// perfectamente bueno.
+	tokenUnverifiableMessage = "no se pudo verificar el token de GitHub (¿sin red?): se conserva el guardado; reintenta o borra con …"
+)
+
 // GitHubOAuth handles GitHub authentication and token management via Device Flow
 type GitHubOAuth struct {
-	log   func(...any)
-	store SecretStore
+	log      func(...any)
+	store    SecretStore
+	validate func(token string) TokenValidationResult // nil ⇒ la implementación real contra la API
+	client   *http.Client                             // nil ⇒ cliente por defecto con timeout
 }
 
 // NewGitHubOAuth creates a new GitHub authentication handler
@@ -47,6 +80,24 @@ func NewGitHubOAuth() *GitHubOAuth {
 func (a *GitHubOAuth) SetStore(store SecretStore) {
 	if store != nil {
 		a.store = store
+	}
+}
+
+// SetTokenValidator overrides how a stored token is validated. Tests inject a
+// fake validator so no real GitHub API call happens; nil (the default) uses
+// the real check against the GitHub API.
+func (a *GitHubOAuth) SetTokenValidator(fn func(token string) TokenValidationResult) {
+	if fn != nil {
+		a.validate = fn
+	}
+}
+
+// SetHTTPClient overrides the HTTP client used for GitHub API calls. Tests
+// inject a client that never leaves the machine; nil (the default) uses a
+// client with a 30s timeout.
+func (a *GitHubOAuth) SetHTTPClient(client *http.Client) {
+	if client != nil {
+		a.client = client
 	}
 }
 
@@ -89,14 +140,23 @@ func (a *GitHubOAuth) EnsureGitHubAuth() error {
 	// Try to load saved token from the store
 	token, err := a.store.Get(githubTokenKey)
 	if err == nil && token != "" {
-		// Verify the token works by configuring gh
-		if a.configureGhWithToken(token) == nil {
-			if _, err := command.Run("gh", "auth", "status"); err == nil {
-				return nil
+		switch a.validateToken(token) {
+		case TokenValid:
+			if err := a.ensureGhSessionMatches(token); err != nil {
+				a.log(logGhConfigFailed + err.Error())
 			}
+			return nil
+
+		case TokenRejected:
+			a.log(logTokenRejected)
+			a.store.Delete(githubTokenKey)
+			// sigue al device flow
+
+		case TokenUnverifiable:
+			// NO se borra nada. El token puede ser perfectamente bueno.
+			a.log(tokenUnverifiableMessage)
+			return errors.New(tokenUnverifiableMessage)
 		}
-		// Token is invalid, remove it
-		a.store.Delete(githubTokenKey)
 	}
 
 	// Not authenticated - initiate Device Flow
@@ -106,6 +166,53 @@ func (a *GitHubOAuth) EnsureGitHubAuth() error {
 	}
 
 	// Configure gh CLI with the new token
+	return a.configureGhWithToken(token)
+}
+
+// validateToken pregunta a GitHub directamente. Es la ÚNICA autoridad sobre si
+// un token sirve: gh puede fallar por su propia configuración sin que el token
+// tenga nada que ver.
+func (a *GitHubOAuth) validateToken(token string) TokenValidationResult {
+	if a.validate != nil {
+		return a.validate(token)
+	}
+
+	req, err := http.NewRequest("GET", githubAPIUserURL, nil)
+	if err != nil {
+		return TokenUnverifiable
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	client := a.client
+	if client == nil {
+		client = &http.Client{Timeout: tokenValidationTimeout}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return TokenUnverifiable
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return TokenValid
+	case http.StatusUnauthorized:
+		return TokenRejected
+	default:
+		return TokenUnverifiable
+	}
+}
+
+// ensureGhSessionMatches configura gh SOLO si su token activo no es ya éste.
+// gh auth login --with-token reescribe la configuración del usuario; hacerlo en
+// cada arranque es una mutación gratuita y una oportunidad de fallo por arranque.
+func (a *GitHubOAuth) ensureGhSessionMatches(token string) error {
+	current, err := command.Run("gh", "auth", "token")
+	if err == nil && strings.TrimSpace(current) == token {
+		return nil
+	}
 	return a.configureGhWithToken(token)
 }
 
@@ -150,6 +257,15 @@ func (a *GitHubOAuth) DeviceFlowAuth() (string, error) {
 	return token, nil
 }
 
+// httpClient devuelve el cliente inyectado con SetHTTPClient, o uno nuevo con
+// el timeout por defecto cuando no se inyectó ninguno.
+func (a *GitHubOAuth) httpClient() *http.Client {
+	if a.client != nil {
+		return a.client
+	}
+	return &http.Client{Timeout: 30 * time.Second}
+}
+
 // requestDeviceCode requests a device code from GitHub
 func (a *GitHubOAuth) requestDeviceCode() (*deviceCodeResponse, error) {
 	data := url.Values{}
@@ -163,7 +279,7 @@ func (a *GitHubOAuth) requestDeviceCode() (*deviceCodeResponse, error) {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := a.httpClient()
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -206,7 +322,7 @@ func (a *GitHubOAuth) pollForToken(deviceCode string, interval, expiresIn int) (
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-		client := &http.Client{Timeout: 30 * time.Second}
+		client := a.httpClient()
 		resp, err := client.Do(req)
 		if err != nil {
 			continue
@@ -264,9 +380,10 @@ func (a *GitHubOAuth) openBrowser(url string) error {
 	return cmd.Start()
 }
 
-// configureGhWithToken configures gh CLI to use the token
+// configureGhWithToken configures gh CLI to use the token. The token travels
+// by stdin, never as a process argument (an argv is visible in the process
+// table and in error messages).
 func (a *GitHubOAuth) configureGhWithToken(token string) error {
-	cmd := exec.Command("gh", "auth", "login", "--with-token")
-	cmd.Stdin = bytes.NewReader([]byte(token))
-	return cmd.Run()
+	_, err := command.RunWithStdin(token, "gh", "auth", "login", "--with-token")
+	return err
 }

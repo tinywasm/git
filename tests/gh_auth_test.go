@@ -12,7 +12,10 @@ import (
 	"github.com/tinywasm/git"
 )
 
-const mockAuthFileEnv = "MOCK_GH_AUTH_FILE"
+const (
+	mockAuthFileEnv = "MOCK_GH_AUTH_FILE"
+	mockLoginLogEnv = "MOCK_GH_LOGIN_LOG"
+)
 
 // mockExecCommand simulates command execution for testing.
 // The mock gh session lives in a temp file (MOCK_GH_AUTH_FILE) so parent and
@@ -79,6 +82,15 @@ func handleGH(args []string) {
 			os.Exit(0)
 		}
 	case "auth":
+		// gh auth token: reports the token of the mock session.
+		if len(args) >= 2 && args[1] == "token" {
+			if !ghMockAuthed() {
+				fmt.Fprintln(os.Stderr, "error: not logged in")
+				os.Exit(1)
+			}
+			fmt.Println("valid-pat")
+			os.Exit(0)
+		}
 		// gh auth login --with-token
 		if len(args) >= 3 && args[1] == "login" && args[2] == "--with-token" {
 			var token string
@@ -86,6 +98,12 @@ func handleGH(args []string) {
 			if token == "valid-pat" {
 				if f, err := os.Create(os.Getenv(mockAuthFileEnv)); err == nil {
 					f.Close()
+				}
+				if logPath := os.Getenv(mockLoginLogEnv); logPath != "" {
+					if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
+						f.WriteString("login\n")
+						f.Close()
+					}
 				}
 				os.Exit(0)
 			}
